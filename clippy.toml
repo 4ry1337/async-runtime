@@ -1,0 +1,18 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+[[disallowed-methods]]
+path = "core::cmp::Ord::min"
+reason = '''
+too easy to misread `x.min(y)` as "let the minimum value of `x` be `y`" when it actually means the exact opposite;
+use `std::cmp::min` instead.
+'''
+
+[[disallowed-methods]]
+path = "core::cmp::Ord::max"
+reason = '''
+too easy to misread `x.max(y)` as "let the maximum value of `x` be `y`" when it actually means the exact opposite;
+use `std::cmp::max` instead.
+'''
