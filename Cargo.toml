@@ -2,10 +2,12 @@
 name = "async-runtime"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 authors = ["Rakhat Yskak <yskak.rakhat@gmail.com>"]
 
 [dependencies]
-tokio = "1"
+reqwest = "0.13"
+tokio = { version = "1", features = ["full"] }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 } # UM, ACTUALLY
