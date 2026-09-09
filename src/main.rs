@@ -1,45 +1,32 @@
-use std::path::PathBuf;
+use std::time::Duration;
 
-use tokio::{
-    fs::File,
-    io::AsyncReadExt,
-    sync::watch,
-    time::{Duration, sleep},
-};
-
-async fn read_file(filename: &str) -> Result<String, std::io::Error> {
-    let mut file = File::open(filename).await?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).await?;
-    Ok(contents)
+struct CounterFuture {
+    count: u32,
 }
 
-async fn watch_file_changes(tx: watch::Sender<bool>) {
-    let path = PathBuf::from("data.txt");
-    let mut last_modified = None;
-    loop {
-        if let Ok(metadata) = path.metadata() {
-            if let Ok(modified) = metadata.modified()
-                && last_modified != Some(modified)
-            {
-                last_modified = Some(modified);
-                let _ = tx.send(true);
-            }
+impl Future for CounterFuture {
+    type Output = u32;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.count = self.count.wrapping_add(1);
+        println!("polling with result: {}", self.count);
+        std::thread::sleep(Duration::from_secs(1));
+        if self.count < 5 {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(self.count)
         }
-        sleep(Duration::from_millis(100)).await;
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let (tx, mut rx) = watch::channel(false);
-
-    tokio::spawn(watch_file_changes(tx));
-
-    loop {
-        let _ = rx.changed().await;
-        if let Ok(contents) = read_file("data.txt").await {
-            println!("{contents}");
-        }
-    }
+    let counter1 = CounterFuture { count: 0 };
+    let counter2 = CounterFuture { count: 0 };
+    let handle1 = tokio::task::spawn(async move { counter1.await });
+    let handle2 = tokio::task::spawn(async move { counter2.await });
+    tokio::join!(handle1, handle2);
 }

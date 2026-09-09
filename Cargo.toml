@@ -6,8 +6,10 @@ license = "MIT"
 authors = ["Rakhat Yskak <yskak.rakhat@gmail.com>"]
 
 [dependencies]
-reqwest = "0.13"
 tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 } # UM, ACTUALLY
