@@ -1,4 +1,5 @@
 use std::{
+    io,
     panic::catch_unwind,
     pin::Pin,
     sync::LazyLock,
@@ -8,7 +9,42 @@ use std::{
 };
 
 use async_task::{Runnable, Task};
+use flume::{Receiver, Sender};
 use futures_lite::future;
+
+macro_rules! spawn_task {
+    ($future:expr) => {
+        spawn_task!($future, FutureType::Low)
+    };
+    ($future:expr, $order:expr) => {
+        spawn_task($future, $order)
+    };
+}
+
+macro_rules! join {
+    ($($future:expr), *) => {
+        {
+            let mut results = Vec::new();
+            $(
+                results.push(future::block_on($future));
+            )*
+            results
+        }
+    };
+}
+
+macro_rules! try_join {
+    ($($future:expr), *) => {
+        {
+            let mut results = Vec::new();
+            $(
+                let result = catch_unwind(|| future::block_on($future));
+                results.push(result);
+            )*
+            results
+        }
+    };
+}
 
 #[derive(Debug, Clone, Copy)]
 enum FutureType {
@@ -16,40 +52,10 @@ enum FutureType {
     Low,
 }
 
-trait FutureOrderLabel {
-    fn get_order(&self) -> FutureType;
-}
-
-static HIGH_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
-    let (tx, rx) = flume::unbounded::<Runnable>();
-    for _ in 0..2 {
-        let receiver = rx.clone();
-        thread::spawn(move || {
-            while let Ok(runnable) = receiver.recv() {
-                let _ = catch_unwind(|| runnable.run());
-            }
-        });
-    }
-    tx
-});
-
-static LOW_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
-    let (tx, rx) = flume::unbounded::<Runnable>();
-    for _ in 0..1 {
-        let receiver = rx.clone();
-        thread::spawn(move || {
-            while let Ok(runnable) = receiver.recv() {
-                let _ = catch_unwind(|| runnable.run());
-            }
-        });
-    }
-    tx
-});
-
-fn spawn_task<F, T>(future: F) -> Task<T>
+fn spawn_task<F, T>(future: F, order: FutureType) -> Task<T>
 //TODO: why 'static in detail?
 where
-    F: Future<Output = T> + Send + 'static + FutureOrderLabel,
+    F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
     let schedule_high = |runnable| match HIGH_QUEUE.send(runnable) {
@@ -64,13 +70,138 @@ where
             println!("{err}");
         }
     };
-    let schedule = match future.get_order() {
+    let schedule = match order {
         FutureType::High => schedule_high,
         FutureType::Low => schedule_low,
     };
     let (runnable, task) = async_task::spawn(future, schedule);
     runnable.schedule();
     task
+}
+
+pub struct Runtime {
+    pub high_num: usize,
+    pub low_num:  usize,
+}
+
+impl Runtime {
+    /// # Errors
+    ///
+    /// Returns an error if the number of available cores can't be determined.
+    pub fn new() -> io::Result<Self> {
+        let num_cores = std::thread::available_parallelism()?.get();
+
+        Ok(Self {
+            high_num: std::cmp::max(num_cores.saturating_sub(2), 1),
+            low_num:  1,
+        })
+    }
+
+    #[must_use]
+    pub const fn with_high_num(mut self, high_num: usize) -> Self {
+        self.high_num = high_num;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_low_num(mut self, low_num: usize) -> Self {
+        self.low_num = low_num;
+        self
+    }
+
+    pub fn run(&self) {
+        unsafe {
+            std::env::set_var("HIGH_NUM", self.high_num.to_string());
+            std::env::set_var("LOW_NUM", self.low_num.to_string());
+        }
+        let high = spawn_task!(async {}, FutureType::High);
+        let low = spawn_task!(async {}, FutureType::Low);
+        join!(high, low);
+    }
+}
+
+static HIGH_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    let high_num = std::env::var("HIGH_NUM")
+        .expect("HIGH_NUM is not set")
+        .parse::<usize>()
+        .expect("HIGH_NUM is not a valid number");
+
+    for index in 0..high_num {
+        let high_receiver = HIGH_CHANNEL.1.clone();
+        let low_receiver = LOW_CHANNEL.1.clone();
+        thread::spawn(move || {
+            loop {
+                match high_receiver.try_recv() {
+                    Ok(runnable) => {
+                        println!("[high thread {index}] running task from high queue");
+                        let _ = catch_unwind(|| runnable.run());
+                    }
+                    Err(_) => match low_receiver.try_recv() {
+                        Ok(runnable) => {
+                            println!("[high thread {index}] running task from low queue");
+                            let _ = catch_unwind(|| runnable.run());
+                        }
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    },
+                }
+            }
+        });
+    }
+    HIGH_CHANNEL.0.clone()
+});
+
+static LOW_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    let low_num = std::env::var("LOW_NUM")
+        .expect("LOW_NUM is not set")
+        .parse::<usize>()
+        .expect("LOW_NUM is not a valid number");
+
+    for index in 0..low_num {
+        let receiver = LOW_CHANNEL.1.clone();
+        thread::spawn(move || {
+            while let Ok(runnable) = receiver.recv() {
+                println!("[low thread {index}] running task from low queue");
+                let _ = catch_unwind(|| runnable.run());
+            }
+        });
+    }
+
+    LOW_CHANNEL.0.clone()
+});
+
+static HIGH_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
+    LazyLock::new(flume::unbounded::<Runnable>);
+
+static LOW_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
+    LazyLock::new(flume::unbounded::<Runnable>);
+
+fn main() {
+    #[allow(clippy::expect_used)]
+    Runtime::new()
+        .expect("RUNTIME ERROR")
+        .with_low_num(2)
+        .with_high_num(4)
+        .run();
+    let one = CounterFuture { count: 0 };
+    let two = CounterFuture { count: 0 };
+    let t_one = spawn_task(one, FutureType::High);
+    let t_two = spawn_task(two, FutureType::Low);
+    let t_three = spawn_task!(async_fn());
+    let t_four = spawn_task!(
+        async {
+            async_fn().await;
+            async_fn().await;
+        },
+        FutureType::High
+    );
+    thread::sleep(Duration::from_secs(5));
+    println!("before the block");
+    let outcome: Vec<u32> = join!(t_one, t_two);
+    let outcome_two: Vec<()> = join!(t_three, t_four);
 }
 
 struct AsyncSleep {
@@ -102,13 +233,6 @@ impl Future for AsyncSleep {
 
 struct CounterFuture {
     count: u32,
-    order: FutureType,
-}
-
-impl FutureOrderLabel for CounterFuture {
-    fn get_order(&self) -> FutureType {
-        self.order
-    }
 }
 
 impl Future for CounterFuture {
@@ -126,31 +250,8 @@ impl Future for CounterFuture {
     }
 }
 
-fn async_fn() {
+#[allow(clippy::unused_async)]
+async fn async_fn() {
     thread::sleep(Duration::from_secs(1));
     println!("async fn");
-}
-
-fn main() {
-    let one = CounterFuture {
-        count: 0,
-        order: FutureType::High,
-    };
-    let two = CounterFuture {
-        count: 0,
-        order: FutureType::Low,
-    };
-    let t_one = spawn_task(one);
-    let t_two = spawn_task(two);
-    /* let t_three = spawn_task(async {
-        async { async_fn() }.await;
-        async { async_fn() }.await;
-        async { async_fn() }.await;
-        async { async_fn() }.await;
-    }); */
-    thread::sleep(Duration::from_secs(5));
-    println!("before the block");
-    future::block_on(t_one);
-    future::block_on(t_two);
-    // future::block_on(t_three);
 }
