@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io,
     panic::catch_unwind,
     pin::Pin,
@@ -9,7 +10,6 @@ use std::{
 };
 
 use async_task::{Runnable, Task};
-use flume::{Receiver, Sender};
 use futures_lite::future;
 
 macro_rules! spawn_task {
@@ -173,10 +173,10 @@ static LOW_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
     LOW_CHANNEL.0.clone()
 });
 
-static HIGH_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
+static HIGH_CHANNEL: LazyLock<(flume::Sender<Runnable>, flume::Receiver<Runnable>)> =
     LazyLock::new(flume::unbounded::<Runnable>);
 
-static LOW_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
+static LOW_CHANNEL: LazyLock<(flume::Sender<Runnable>, flume::Receiver<Runnable>)> =
     LazyLock::new(flume::unbounded::<Runnable>);
 
 fn main() {
@@ -186,6 +186,7 @@ fn main() {
         .with_low_num(2)
         .with_high_num(4)
         .run();
+    let _background = spawn_task!(BackgroundProcess {}).detach();
     let one = CounterFuture { count: 0 };
     let two = CounterFuture { count: 0 };
     let t_one = spawn_task(one, FutureType::High);
@@ -254,4 +255,18 @@ impl Future for CounterFuture {
 async fn async_fn() {
     thread::sleep(Duration::from_secs(1));
     println!("async fn");
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackgroundProcess;
+
+impl Future for BackgroundProcess {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        println!("background process firing!");
+        std::thread::sleep(Duration::from_secs(1));
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
